@@ -71,6 +71,9 @@ import ml.docilealligator.infinityforreddit.post.PostType;
 import ml.docilealligator.infinityforreddit.readpost.ReadPostModification;
 import ml.docilealligator.infinityforreddit.readpost.ReadPostType;
 import ml.docilealligator.infinityforreddit.readpost.ReadPostsUtils;
+import ml.docilealligator.infinityforreddit.resume.FeedResumeState;
+import ml.docilealligator.infinityforreddit.resume.Restorable;
+import ml.docilealligator.infinityforreddit.resume.ResumeLaunchExtras;
 import ml.docilealligator.infinityforreddit.subreddit.ParseSubredditData;
 import ml.docilealligator.infinityforreddit.subreddit.SubredditData;
 import ml.docilealligator.infinityforreddit.thing.SelectThingReturnKey;
@@ -89,7 +92,7 @@ import retrofit2.Retrofit;
 public class ViewMultiRedditDetailActivity extends BaseActivity implements SortTypeSelectionCallback,
         PostLayoutBottomSheetFragment.PostLayoutSelectionCallback, ActivityToolbarInterface, MarkPostAsReadInterface,
         PostTypeBottomSheetFragment.PostTypeSelectionCallback, FABMoreOptionsBottomSheetFragment.FABOptionSelectionCallback,
-        RecyclerViewContentScrollingInterface {
+        RecyclerViewContentScrollingInterface, Restorable, ResumeLaunchExtras {
 
     public static final String EXTRA_MULTIREDDIT_DATA = "EMD";
     public static final String EXTRA_MULTIREDDIT_PATH = "EMP";
@@ -142,6 +145,9 @@ public class ViewMultiRedditDetailActivity extends BaseActivity implements SortT
     private String initialSortTime;
     @SuppressWarnings("NullAway.Init")
     private Fragment mFragment;
+    // Resume where I left off. The multireddit path travels in the intent extras, so only the
+    // feed's own record needs storing here.
+    private final FeedResumeState resumeFeed = new FeedResumeState();
     private int fabOption;
     private boolean hideFab;
     private boolean showBottomAppBar;
@@ -168,6 +174,11 @@ public class ViewMultiRedditDetailActivity extends BaseActivity implements SortT
 
         binding = ActivityViewMultiRedditDetailBinding.inflate(getLayoutInflater());
         setContentView(binding.getRoot());
+
+        trackAppBarOffsetForResume(binding.appbarLayoutViewMultiRedditDetailActivity);
+
+        // Before the feed fragment is built, so the record it is given is the recorded one.
+        claimResumeState();
 
         EventBus.getDefault().register(this);
 
@@ -522,8 +533,69 @@ public class ViewMultiRedditDetailActivity extends BaseActivity implements SortT
                 bundle.putString(PostFragment.EXTRA_INITIAL_SORT_TIME, initialSortTime);
             }
         }
+        // One-shot, so a fragment rebuilt later cannot replay the restore.
+        resumeFeed.applyTo(bundle);
         mFragment.setArguments(bundle);
         getSupportFragmentManager().beginTransaction().replace(R.id.frame_layout_view_multi_reddit_detail_activity, mFragment).commit();
+    }
+
+    /**
+     * The launch extras with the multireddit itself swapped for its path.
+     *
+     * <p>{@link #EXTRA_MULTIREDDIT_DATA} is a {@code Parcelable}, and a marshalled {@code Parcel}
+     * is never written to disk -- so a multireddit opened from the drawer was unrecordable, the
+     * snapshot truncated at the screen below it, and a restart put the user back on the
+     * Multireddits tab of Subscriptions instead of in the feed they were reading.
+     *
+     * <p>Nothing has to be invented to replace it: this screen already accepts
+     * {@link #EXTRA_MULTIREDDIT_PATH} on its own and fetches the rest, which is the path a link
+     * into a multireddit takes. The cost of the swap is that one refetch.
+     */
+    @Nullable
+    @Override
+    public Bundle resumeLaunchExtras() {
+        Bundle extras = getIntent().getExtras();
+        if (extras == null) {
+            return null;
+        }
+        Bundle out = new Bundle(extras);
+        MultiReddit launchedWith = getIntent().getParcelableExtra(EXTRA_MULTIREDDIT_DATA);
+        if (launchedWith != null) {
+            out.remove(EXTRA_MULTIREDDIT_DATA);
+            out.putString(EXTRA_MULTIREDDIT_PATH, launchedWith.getPath());
+        }
+        return out;
+    }
+
+    /**
+     * The path, which is what tells one multireddit screen from another and is the one thing the
+     * codec cannot see inside the {@code Parcelable} above.
+     */
+    @Nullable
+    @Override
+    public String resumeIdentity() {
+        MultiReddit launchedWith = getIntent().getParcelableExtra(EXTRA_MULTIREDDIT_DATA);
+        return launchedWith != null
+                ? launchedWith.getPath()
+                : getIntent().getStringExtra(EXTRA_MULTIREDDIT_PATH);
+    }
+
+    @Override
+    public void saveResumeState(@NonNull Bundle out) {
+        // Nothing at all rather than a record that cannot say where in the feed the user was: that
+        // would reopen this screen scrolled to the top and overwrite a good record from a moment
+        // ago.
+        if (mFragment instanceof PostFragment
+                && ((PostFragment) mFragment).captureResumeState(out)) {
+            saveResumeAppBarOffset(out);
+        }
+    }
+
+    @Override
+    public void restoreResumeState(@NonNull Bundle state) {
+        resumeFeed.read(state);
+        restoreResumeAppBarOffset(state, binding.appbarLayoutViewMultiRedditDetailActivity,
+                binding.frameLayoutViewMultiRedditDetailActivity);
     }
 
     private void bottomAppBarOptionAction(int option) {

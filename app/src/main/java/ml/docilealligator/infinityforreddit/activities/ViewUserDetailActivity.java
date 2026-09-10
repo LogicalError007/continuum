@@ -103,6 +103,9 @@ import ml.docilealligator.infinityforreddit.readpost.ReadPostModification;
 import ml.docilealligator.infinityforreddit.readpost.ReadPostType;
 import ml.docilealligator.infinityforreddit.readpost.ReadPostsUtils;
 import ml.docilealligator.infinityforreddit.recentlyvisited.RecordRecentlyVisited;
+import ml.docilealligator.infinityforreddit.resume.FeedResumeState;
+import ml.docilealligator.infinityforreddit.resume.Restorable;
+import ml.docilealligator.infinityforreddit.resume.ResumeLaunchExtras;
 import ml.docilealligator.infinityforreddit.subreddit.ParseSubredditData;
 import ml.docilealligator.infinityforreddit.subreddit.SubredditData;
 import ml.docilealligator.infinityforreddit.thing.DeleteThing;
@@ -129,9 +132,11 @@ import retrofit2.Retrofit;
 public class ViewUserDetailActivity extends BaseActivity implements SortTypeSelectionCallback,
         PostTypeBottomSheetFragment.PostTypeSelectionCallback, PostLayoutBottomSheetFragment.PostLayoutSelectionCallback,
         ActivityToolbarInterface, FABMoreOptionsBottomSheetFragment.FABOptionSelectionCallback,
-        MarkPostAsReadInterface, RecyclerViewContentScrollingInterface {
+        MarkPostAsReadInterface, RecyclerViewContentScrollingInterface, Restorable,
+        ResumeLaunchExtras {
 
     public static final String EXTRA_USER_NAME_KEY = "EUNK";
+    private static final String STATE_RESUME_TAB = "RTB";
     public static final String EXTRA_MESSAGE_FULLNAME = "ENF";
     public static final String EXTRA_NEW_ACCOUNT_NAME = "ENAN";
     // Sort (?sort=/?t=) and initial tab carried by an opening deep link, for the submitted tab.
@@ -185,6 +190,10 @@ public class ViewUserDetailActivity extends BaseActivity implements SortTypeSele
     public UserViewModel userViewModel;
     private FragmentManager fragmentManager;
     private SectionsPagerAdapter sectionsPagerAdapter;
+    // Resume where I left off. The username travels in the intent extras; only the tab and the
+    // feed's own record need storing.
+    private final FeedResumeState resumeFeed = new FeedResumeState();
+    private int resumeTab = -1;
     private RequestManager glide;
     private NavigationWrapper navigationWrapper;
     @Nullable
@@ -240,6 +249,12 @@ public class ViewUserDetailActivity extends BaseActivity implements SortTypeSele
 
         binding = ActivityViewUserDetailBinding.inflate(getLayoutInflater());
         setContentView(binding.getRoot());
+
+        trackAppBarOffsetForResume(binding.appbarLayoutViewUserDetail);
+
+        // Before initializeViewPager() picks the tab to open on, which happens further down this
+        // method and is never revisited.
+        claimResumeState();
 
         hideFab = mSharedPreferences.getBoolean(SharedPreferencesUtils.HIDE_FAB_IN_POST_FEED, false);
         showBottomAppBar = mSharedPreferences.getBoolean(SharedPreferencesUtils.BOTTOM_APP_BAR_KEY, false);
@@ -900,6 +915,10 @@ public class ViewUserDetailActivity extends BaseActivity implements SortTypeSele
         // launches via initialTab (only set when savedInstanceState == null), so rotation keeps the tab.
         if (initialTab != TAB_POSTS) {
             binding.viewPagerViewUserDetailActivity.setCurrentItem(initialTab, false);
+        } else if (resumeTab >= 0) {
+            // A tab named by the opening intent wins over a resume: it is what the user asked for
+            // just now, where the resume is what they asked for last time.
+            binding.viewPagerViewUserDetailActivity.setCurrentItem(resumeTab, false);
         }
 
         binding.viewPagerViewUserDetailActivity.registerOnPageChangeCallback(new ViewPager2.OnPageChangeCallback() {
@@ -1829,10 +1848,85 @@ public class ViewUserDetailActivity extends BaseActivity implements SortTypeSele
         }
     }
 
+    /**
+     * The launch extras with the one-shot navigation extras taken out.
+     *
+     * <p>These say "open showing this, just this once" -- a tab named by a link, a message to mark
+     * read, an account to switch to on the way in. They answer what the user did at the moment they
+     * arrived, and a replay is not that moment. Left in, every resume would reopen this screen the
+     * way a link opened it weeks ago, overriding the place actually recorded, and the account-switch
+     * extra would re-run its switch on each launch.
+     */
+    @Nullable
+    @Override
+    public Bundle resumeLaunchExtras() {
+        Bundle extras = getIntent().getExtras();
+        if (extras == null) {
+            return null;
+        }
+        Bundle out = new Bundle(extras);
+        out.remove(EXTRA_INITIAL_TAB);
+        out.remove(EXTRA_MESSAGE_FULLNAME);
+        out.remove(EXTRA_NEW_ACCOUNT_NAME);
+        return out;
+    }
+
+    @Override
+    public void saveResumeState(@NonNull Bundle out) {
+        if (sectionsPagerAdapter == null || binding == null || fragmentManager == null) {
+            return;
+        }
+        int page = binding.viewPagerViewUserDetailActivity.getCurrentItem();
+        Fragment fragment = fragmentManager.findFragmentByTag("f" + page);
+        // Whichever tab is open has to say where in it the user was, and both can. Asking only the
+        // posts tab used to let the comments tab through describing nothing: the tab was recorded,
+        // the position was not, and the app bar offset below was written anyway -- so a resume onto
+        // Comments put the header back collapsed over a list at the top, with every row that much
+        // higher than it was left.
+        //
+        // Nothing at all is written when the tab cannot answer, rather than a record that names a
+        // tab but not the place in it: that would reopen the screen scrolled to the top and
+        // overwrite a good record from a moment ago to do it.
+        boolean captured;
+        if (fragment instanceof PostFragment) {
+            captured = ((PostFragment) fragment).captureResumeState(out);
+        } else if (fragment instanceof CommentsListingFragment) {
+            captured = ((CommentsListingFragment) fragment).captureResumeState(out);
+        } else {
+            captured = false;
+        }
+        if (!captured) {
+            return;
+        }
+        out.putInt(STATE_RESUME_TAB, page);
+        saveResumeAppBarOffset(out);
+    }
+
+    @Override
+    public void restoreResumeState(@NonNull Bundle state) {
+        resumeTab = state.getInt(STATE_RESUME_TAB, -1);
+        resumeFeed.read(state);
+        restoreResumeAppBarOffset(state, binding.appbarLayoutViewUserDetail,
+                binding.viewPagerViewUserDetailActivity);
+    }
+
     private class SectionsPagerAdapter extends FragmentStateAdapter {
 
         SectionsPagerAdapter(FragmentActivity fa) {
             super(fa);
+        }
+
+        /**
+         * Hand the resume record down, but only to the tab it was written for.
+         *
+         * <p>The record is one-shot -- the first page to ask for it takes it -- so which page the
+         * pager happens to build first must not decide who gets it. The recorded tab does, and it
+         * is written alongside the record or not at all.
+         */
+        private void applyResumeFeedTo(Bundle bundle, int tab) {
+            if (resumeTab == tab) {
+                resumeFeed.applyTo(bundle);
+            }
         }
 
         @NonNull
@@ -1850,6 +1944,8 @@ public class ViewUserDetailActivity extends BaseActivity implements SortTypeSele
                         bundle.putString(PostFragment.EXTRA_INITIAL_SORT_TIME, initialSortTime);
                     }
                 }
+                // One-shot, so a rebuilt adapter cannot replay the restore onto a second fragment.
+                applyResumeFeedTo(bundle, TAB_POSTS);
                 fragment.setArguments(bundle);
                 return fragment;
             }
@@ -1857,6 +1953,7 @@ public class ViewUserDetailActivity extends BaseActivity implements SortTypeSele
             Bundle bundle = new Bundle();
             bundle.putString(CommentsListingFragment.EXTRA_USERNAME, username);
             bundle.putBoolean(CommentsListingFragment.EXTRA_ARE_SAVED_COMMENTS, false);
+            applyResumeFeedTo(bundle, TAB_COMMENTS);
             if (initialSortType != null && initialTab == TAB_COMMENTS) {
                 bundle.putString(CommentsListingFragment.EXTRA_INITIAL_SORT_TYPE, initialSortType);
                 if (initialSortTime != null) {

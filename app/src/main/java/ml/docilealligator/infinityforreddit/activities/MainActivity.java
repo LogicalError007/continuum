@@ -20,6 +20,7 @@ import android.os.Bundle;
 import android.os.Handler;
 import android.text.Editable;
 import android.text.TextWatcher;
+import android.util.Log;
 import android.view.Gravity;
 import android.view.KeyEvent;
 import android.view.Menu;
@@ -124,6 +125,9 @@ import ml.docilealligator.infinityforreddit.readpost.ReadPostModification;
 import ml.docilealligator.infinityforreddit.readpost.ReadPostType;
 import ml.docilealligator.infinityforreddit.readpost.ReadPostsUtils;
 import ml.docilealligator.infinityforreddit.recentlyvisited.RecordRecentlyVisited;
+import ml.docilealligator.infinityforreddit.resume.FeedResumeState;
+import ml.docilealligator.infinityforreddit.resume.Restorable;
+import ml.docilealligator.infinityforreddit.resume.ResumeState;
 import ml.docilealligator.infinityforreddit.settings.MainPageTabInput;
 import ml.docilealligator.infinityforreddit.settings.MainPageTabsUtils;
 import ml.docilealligator.infinityforreddit.subreddit.ParseSubredditData;
@@ -154,7 +158,7 @@ import retrofit2.Retrofit;
 public class MainActivity extends BaseActivity implements SortTypeSelectionCallback,
         PostTypeBottomSheetFragment.PostTypeSelectionCallback, PostLayoutBottomSheetFragment.PostLayoutSelectionCallback,
         ActivityToolbarInterface, FABMoreOptionsBottomSheetFragment.FABOptionSelectionCallback,
-        MarkPostAsReadInterface, RecyclerViewContentScrollingInterface {
+        MarkPostAsReadInterface, RecyclerViewContentScrollingInterface, Restorable {
 
     static final String EXTRA_MESSAGE_FULLNAME = "ENF";
     static final String EXTRA_NEW_ACCOUNT_NAME = "ENAN";
@@ -168,6 +172,12 @@ public class MainActivity extends BaseActivity implements SortTypeSelectionCallb
     private static final String NEW_ACCOUNT_NAME_STATE = "NANS";
     private static final String APP_BAR_COLLAPSED_STATE = "ABCS";
     private static final String BOTTOM_APP_BAR_HIDDEN_STATE = "BABH";
+    // Resume where I left off: the tab the user was on, as a MainPageTabsUtils user key rather than
+    // an index. The tab list is rebuilt from the subscription and multireddit data on every launch
+    // and its order is not stable, so an index can name a different subreddit next time.
+    private static final String STATE_RESUME_TAB_KEY = "RTK";
+    /** Whether the bottom app bar was scrolled away. See {@link #saveResumeState}. */
+    private static final String STATE_RESUME_BOTTOM_BAR_HIDDEN = "RBBH";
 
     @SuppressWarnings("NullAway.Init")
     MultiRedditViewModel multiRedditViewModel;
@@ -255,6 +265,17 @@ public class MainActivity extends BaseActivity implements SortTypeSelectionCallb
     private String mMessageFullname;
     @Nullable
     private String mNewAccountName;
+    private final FeedResumeState resumeFeed = new FeedResumeState();
+    @Nullable
+    private String resumeTabKey;
+    /**
+     * The tab named by the last record that also carried a position, so a later capture with
+     * nothing to say about the same tab can leave that record alone. See
+     * {@link #saveResumeState}.
+     */
+    @Nullable
+    private String lastCapturedTabKey;
+    private boolean resumeTabApplied;
     private boolean hideFab;
     private boolean showBottomAppBar;
     private int mBackButtonAction;
@@ -272,7 +293,7 @@ public class MainActivity extends BaseActivity implements SortTypeSelectionCallb
     @ExperimentalBadgeUtils
     @Override
     protected void onCreate(@Nullable Bundle savedInstanceState) {
-        SplashScreen.installSplashScreen(this);
+        SplashScreen splashScreen = SplashScreen.installSplashScreen(this);
 
         ((Infinity) getApplication()).getAppComponent().inject(this);
 
@@ -282,8 +303,46 @@ public class MainActivity extends BaseActivity implements SortTypeSelectionCallb
 
         super.onCreate(savedInstanceState);
 
+        // The skip flag describes one launch, not every rebuild of it: Android hands the task's
+        // original intent back each time this screen is recreated, so a restart's flag left in
+        // place would go on suppressing the resume for the life of the task.
+        Intent launchIntent = getIntent();
+        if (savedInstanceState != null && launchIntent != null) {
+            launchIntent.removeExtra(ResumeState.EXTRA_SKIP_RESUME);
+        }
+
+        // Before anything builds the pager: the tab to open on has to be known by the time the
+        // adapter is created, and the screens that were above this one have to be launched before
+        // the user sees this one settle.
+        boolean replayingResumedStack = false;
+        if (savedInstanceState == null && isPlainLaunch(getIntent())
+                && !ResumeState.isSkipped(getIntent())) {
+            // Before claiming, so the snapshot is still whole when it is read.
+            replayingResumedStack = replayResumedStack();
+        }
+
         binding = ActivityMainBinding.inflate(getLayoutInflater());
         setContentView(binding.getRoot());
+
+        // The screens of the replay are on their way up, and this one is what the launcher started
+        // -- so without this the feed draws first and the user reads it for about a quarter of a
+        // second before the screen they actually left replaces it. Holding this frame back leaves
+        // the launcher's splash where it is until a replayed screen has drawn one of its own.
+        //
+        // After setContentView, because the condition is installed on android.R.id.content and
+        // resolving that installs the decor; by here it is installed anyway and the theme is
+        // settled. Still well before anything can draw.
+        if (replayingResumedStack) {
+            ResumeState.holdLaunchFrame();
+            splashScreen.setKeepOnScreenCondition(ResumeState::isHoldingLaunchFrame);
+        }
+
+        // Before the claim below, which reads the recorded offset back through the same field.
+        trackAppBarOffsetForResume(binding.includedAppBar.appbarLayoutMainActivity);
+
+        // After the binding exists, because restoring the app bar touches it, and before anything
+        // builds the pager, because the tab to open on has to be known by then.
+        claimResumeState();
 
         hideFab = mSharedPreferences.getBoolean(SharedPreferencesUtils.HIDE_FAB_IN_POST_FEED, false);
         showBottomAppBar = mSharedPreferences.getBoolean(SharedPreferencesUtils.BOTTOM_APP_BAR_KEY, false);
@@ -483,17 +542,7 @@ public class MainActivity extends BaseActivity implements SortTypeSelectionCallb
                 // the scroll-restore's contentScrollUp don't re-show them, and re-hide once
                 // the views are laid out. In landscape (navigation rail) bottomAppBar is null
                 // and there's nothing to hide, but the flag/state still carry to portrait.
-                mKeepBottomBarHiddenOnRestore = true;
-                binding.getRoot().post(() -> {
-                    if (navigationWrapper != null && navigationWrapper.bottomAppBar != null) {
-                        navigationWrapper.bottomAppBar.performHide(false);
-                    }
-                    if (navigationWrapper != null) {
-                        navigationWrapper.hideFab();
-                    }
-                });
-                binding.getRoot().postDelayed(
-                        () -> mKeepBottomBarHiddenOnRestore = false, 800);
+                reHideBottomBarAfterLayout();
             }
         } else {
             mMessageFullname = getIntent().getStringExtra(EXTRA_MESSAGE_FULLNAME);
@@ -1094,6 +1143,23 @@ public class MainActivity extends BaseActivity implements SortTypeSelectionCallb
                             boolean newValue = !mSharedPreferences.getBoolean(SharedPreferencesUtils.SHOW_THUMBNAIL_ON_THE_LEFT_IN_COMPACT_LAYOUT, false);
                             mSharedPreferences.edit().putBoolean(SharedPreferencesUtils.SHOW_THUMBNAIL_ON_THE_LEFT_IN_COMPACT_LAYOUT, newValue).apply();
                             EventBus.getDefault().post(new ShowThumbnailOnTheLeftInCompactLayoutEvent(newValue));
+                        } else if (stringId == R.string.enable_resume_where_i_left_off) {
+                            // The drawer row sends this one string id whichever way it is about to
+                            // flip; the stored value is what decides. Everything that cares about
+                            // the setting -- the feeds, and the drawer row's own label -- observes
+                            // it, so writing it is the whole of the toggle.
+                            boolean newValue = !mSharedPreferences.getBoolean(SharedPreferencesUtils.RESUME_WHERE_I_LEFT_OFF, false);
+                            mSharedPreferences.edit().putBoolean(SharedPreferencesUtils.RESUME_WHERE_I_LEFT_OFF, newValue).apply();
+                            if (!newValue) {
+                                // Turning it off forgets the recorded stack and the posts it points
+                                // at, exactly as the Settings switch does -- otherwise the two ways
+                                // of turning the same setting off would leave different amounts of
+                                // it behind. Off the main thread because it reads and unlinks the
+                                // snapshot file, and on the application context because this
+                                // activity may be gone before it finishes.
+                                Context appContext = getApplicationContext();
+                                mExecutor.execute(() -> ResumeState.clear(appContext));
+                            }
                         } else if (stringId == R.string.settings) {
                             intent = new Intent(MainActivity.this, SettingsActivity.class);
                         } else if (stringId == R.string.add_account) {
@@ -1112,14 +1178,14 @@ public class MainActivity extends BaseActivity implements SortTypeSelectionCallb
                                 intent = new Intent(MainActivity.this, LoginActivity.class);
                             }
                         } else if (stringId == R.string.anonymous_account) {
-                            AccountManagement.switchToAnonymousMode(mRedditDataRoomDatabase, mCurrentAccountSharedPreferences,
+                            AccountManagement.switchToAnonymousMode(MainActivity.this, mRedditDataRoomDatabase, mCurrentAccountSharedPreferences,
                                     mExecutor, new Handler(), false, () -> {
                                         Intent anonymousIntent = new Intent(MainActivity.this, MainActivity.class);
                                         startActivity(anonymousIntent);
                                         finish();
                                     });
                         } else if (stringId == R.string.log_out) {
-                            AccountManagement.switchToAnonymousMode(mRedditDataRoomDatabase, mCurrentAccountSharedPreferences,
+                            AccountManagement.switchToAnonymousMode(MainActivity.this, mRedditDataRoomDatabase, mCurrentAccountSharedPreferences,
                                     mExecutor, new Handler(), true,
                                     () -> {
                                         Intent logOutIntent = new Intent(MainActivity.this, MainActivity.class);
@@ -1156,7 +1222,7 @@ public class MainActivity extends BaseActivity implements SortTypeSelectionCallb
                         .setTitle(R.string.log_out)
                         .setMessage(accountName)
                         .setPositiveButton(R.string.yes,
-                                (dialogInterface, i) -> AccountManagement.removeAccount(mRedditDataRoomDatabase, mExecutor, accountName))
+                                (dialogInterface, i) -> AccountManagement.removeAccount(MainActivity.this, mRedditDataRoomDatabase, mExecutor, accountName))
                         .setNegativeButton(R.string.no, null)
                         .show();
             }
@@ -1176,6 +1242,9 @@ public class MainActivity extends BaseActivity implements SortTypeSelectionCallb
         SharedPreferencesLiveDataKt.booleanLiveData(mRecentlyVisitedSharedPreferences,
                         AccountScope.key(accountName, SharedPreferencesUtils.RECENTLY_VISITED_ENABLED_BASE), false)
                 .observe(this, enabled -> adapter.setShowRecentlyVisited(enabled));
+        SharedPreferencesLiveDataKt.booleanLiveData(mSharedPreferences,
+                        SharedPreferencesUtils.RESUME_WHERE_I_LEFT_OFF, false)
+                .observe(this, enabled -> adapter.setResumeWhereILeftOff(enabled));
         binding.navDrawerRecyclerViewMainActivity.setLayoutManager(new LinearLayoutManagerBugFixed(this));
         binding.navDrawerRecyclerViewMainActivity.setAdapter(adapter.getConcatAdapter());
 
@@ -1188,6 +1257,7 @@ public class MainActivity extends BaseActivity implements SortTypeSelectionCallb
         sectionsPagerAdapter = new SectionsPagerAdapter(this,
                 MainPageTabsUtils.load(mMainActivityTabsSharedPreferences, accountName));
         binding.includedAppBar.viewPagerMainActivity.setAdapter(sectionsPagerAdapter);
+        applyResumeTab();
         binding.includedAppBar.viewPagerMainActivity.setUserInputEnabled(!mDisableSwipingBetweenTabs);
         if (mMainActivityTabsSharedPreferences.getBoolean(AccountScope.key(accountName, SharedPreferencesUtils.MAIN_PAGE_SHOW_TAB_NAMES), true)) {
             // Always scrollable so tabs render at their natural width and never wrap.
@@ -1877,6 +1947,155 @@ public class MainActivity extends BaseActivity implements SortTypeSelectionCallb
         handleGoHomeIntent(intent);
     }
 
+    /**
+     * Whether this launch is just "open the app", as opposed to a deep link, a notification tap or
+     * a shortcut. Only a plain launch replays the recorded stack: anything else is the user asking
+     * for something specific, and burying it under their browsing history would be wrong.
+     */
+    private boolean isPlainLaunch(@Nullable Intent intent) {
+        if (intent == null) {
+            return true;
+        }
+        String action = intent.getAction();
+        if (action != null && !Intent.ACTION_MAIN.equals(action)) {
+            return false;
+        }
+        Bundle extras = intent.getExtras();
+        return extras == null || extras.isEmpty();
+    }
+
+    /**
+     * Put back the screens that were above this one when the app was last closed.
+     *
+     * @return whether any were launched, which is what decides whether this screen holds its first
+     *         frame back for them. See {@link ResumeState#holdLaunchFrame()}.
+     */
+    private boolean replayResumedStack() {
+        Intent[] above = ResumeState.buildRestoreIntents(this);
+        if (above == null || above.length == 0) {
+            return false;
+        }
+        try {
+            startActivities(above);
+            return true;
+        } catch (RuntimeException e) {
+            // A screen that can no longer be launched is not worth failing the launch over: the
+            // user still gets their feed, just not what was on top of it. The screens it was
+            // waiting for are never coming, so let it start recording this stack instead. Nothing
+            // to release here: the hold is raised on what this returns, so a false leaves it down.
+            ResumeState.endReplay();
+            Log.e("MainActivity", "could not replay the resumed stack", e);
+            return false;
+        }
+    }
+
+    /**
+     * Put the bottom app bar and its FAB back out of sight, once the views exist.
+     *
+     * <p>Shared by the rotation restore and the resume: both rebuild a screen whose bar the user
+     * had already scrolled away, and both find it reset to shown. The suppression window is the
+     * reason this is not a plain {@code performHide} -- the ViewPager's {@code onPageSelected} and
+     * the scroll restore both call {@code contentScrollUp}, which would show it straight back.
+     *
+     * <p>In landscape the bar is a navigation rail and there is nothing to hide, but the flag still
+     * carries across to portrait.
+     */
+    private void reHideBottomBarAfterLayout() {
+        mKeepBottomBarHiddenOnRestore = true;
+        binding.getRoot().post(() -> {
+            if (navigationWrapper != null && navigationWrapper.bottomAppBar != null) {
+                navigationWrapper.bottomAppBar.performHide(false);
+            }
+            if (navigationWrapper != null) {
+                navigationWrapper.hideFab();
+            }
+        });
+        binding.getRoot().postDelayed(() -> mKeepBottomBarHiddenOnRestore = false, 800);
+    }
+
+    /**
+     * Record which tab the user was on, where in it they were, and whether the bottom bar was
+     * scrolled away.
+     *
+     * <p>The tab and the position are not the same kind of fact. The tab is one this screen always
+     * knows; the position depends on a feed that may still be loading. Requiring both used to lose
+     * the tab as well: switching to Popular and leaving before it finished loading wrote nothing,
+     * so the last good record -- Home -- stood, and the app reopened on Home.
+     *
+     * <p>So a tab with no position is recorded, but only when it is a different tab from the one
+     * the last good record named. Re-recording the same tab without its position is the case the
+     * old rule was really guarding: it would throw away a position that is still true, which is how
+     * a capture during startup used to scroll the user back to the top of the feed they left.
+     */
+    @Override
+    public void saveResumeState(@NonNull Bundle out) {
+        if (sectionsPagerAdapter == null || binding == null) {
+            return;
+        }
+        String tabKey = sectionsPagerAdapter.userKeyAtPosition(
+                binding.includedAppBar.viewPagerMainActivity.getCurrentItem());
+        if (tabKey == null) {
+            return;
+        }
+        PostFragment currentFragment = sectionsPagerAdapter.getCurrentFragment();
+        boolean captured = currentFragment != null && currentFragment.captureResumeState(out);
+        if (!captured && tabKey.equals(lastCapturedTabKey)) {
+            return;
+        }
+        out.putString(STATE_RESUME_TAB_KEY, tabKey);
+        out.putBoolean(STATE_RESUME_BOTTOM_BAR_HIDDEN, mBottomBarHidden);
+        if (captured) {
+            lastCapturedTabKey = tabKey;
+            saveResumeAppBarOffset(out);
+        } else {
+            // The record just written carries no position, so there is none left to protect. Left
+            // pointing at the tab it used to name, this would refuse the next tab-only capture and
+            // resume onto a tab the user had already moved away from.
+            lastCapturedTabKey = null;
+        }
+    }
+
+    @Override
+    public void restoreResumeState(@NonNull Bundle state) {
+        resumeTabKey = state.getString(STATE_RESUME_TAB_KEY);
+        resumeFeed.read(state);
+        // The tab this record names is the one whose position it carries, so a capture that cannot
+        // describe that same tab must not overwrite it. Without this the first capture of the new
+        // session -- a pause before the restored feed has settled -- would do exactly that. A
+        // record that carried no position leaves this null: there is nothing to protect.
+        lastCapturedTabKey = resumeFeed.isPending() ? resumeTabKey : null;
+        if (state.getBoolean(STATE_RESUME_BOTTOM_BAR_HIDDEN, false)) {
+            // Left scrolled away, so it comes back scrolled away. Same window as the rotation path:
+            // the restore itself calls contentScrollUp, which would show it again.
+            mBottomBarHidden = true;
+            reHideBottomBarAfterLayout();
+        }
+        // Without this the feed comes back at the right adapter position but pushed down by the
+        // part of the toolbar that was scrolled off when the user left -- every row off by the same
+        // constant, which is the same failure the rotation path guards against above.
+        restoreResumeAppBarOffset(state, binding.includedAppBar.appbarLayoutMainActivity,
+                binding.includedAppBar.viewPagerMainActivity);
+    }
+
+    /**
+     * Move to the tab a resume asked for, once it exists.
+     *
+     * Called after the adapter is built and again after every tab refresh: the dynamic tabs arrive
+     * asynchronously from the subscription and multireddit LiveData, so the tab the user left may
+     * not be in the list at the moment the pager is first populated.
+     */
+    private void applyResumeTab() {
+        if (resumeTabApplied || resumeTabKey == null || sectionsPagerAdapter == null) {
+            return;
+        }
+        int position = sectionsPagerAdapter.positionOfUserKey(resumeTabKey);
+        if (position < 0) {
+            return;
+        }
+        resumeTabApplied = true;
+        binding.includedAppBar.viewPagerMainActivity.setCurrentItem(position, false);
+    }
+
     private void handleGoHomeIntent(Intent intent) {
         if (intent.getBooleanExtra(EXTRA_GO_HOME, false)) {
             binding.includedAppBar.viewPagerMainActivity.setCurrentItem(0, false);
@@ -2150,6 +2369,8 @@ public class MainActivity extends BaseActivity implements SortTypeSelectionCallb
             }
             resolvedTabsCache = newResolved;
             notifyDataSetChanged();
+            // The tab a resume asked for may only now have arrived from the dynamic lists.
+            applyResumeTab();
         }
 
         private boolean sameResolvedTabs(List<ResolvedTab> a, List<ResolvedTab> b) {
@@ -2278,6 +2499,19 @@ public class MainActivity extends BaseActivity implements SortTypeSelectionCallb
         }
 
         private Fragment generatePostFragment(int postType, String name) {
+            Fragment fragment = buildPostFragment(postType, name);
+            // The tab being built is the one the user left, so hand it the feed record. applyTo is
+            // one-shot: the pager builds the neighbouring page as well, and a rebuilt adapter would
+            // otherwise replay the restore onto a feed the user never left.
+            if (resumeTabKey != null
+                    && resumeTabKey.equals(MainPageTabsUtils.userKey(postType, name))
+                    && fragment.getArguments() != null) {
+                resumeFeed.applyTo(fragment.getArguments());
+            }
+            return fragment;
+        }
+
+        private Fragment buildPostFragment(int postType, String name) {
             if (postType == SharedPreferencesUtils.MAIN_PAGE_TAB_POST_TYPE_HOME) {
                 PostFragment fragment = new PostFragment();
                 Bundle bundle = new Bundle();
@@ -2385,6 +2619,29 @@ public class MainActivity extends BaseActivity implements SortTypeSelectionCallb
             }
             ResolvedTab tab = resolved.get(position);
             return idForKey(MainPageTabsUtils.userKey(tab.postType, tab.name));
+        }
+
+        /** The user key of the tab at {@code position}, or null if there is no such tab. */
+        @Nullable
+        String userKeyAtPosition(int position) {
+            List<ResolvedTab> resolved = resolvedTabs();
+            if (position < 0 || position >= resolved.size()) {
+                return null;
+            }
+            ResolvedTab tab = resolved.get(position);
+            return MainPageTabsUtils.userKey(tab.postType, tab.name);
+        }
+
+        /** Position of the tab with this user key, or -1 while it is not in the list. */
+        int positionOfUserKey(String userKey) {
+            List<ResolvedTab> resolved = resolvedTabs();
+            for (int i = 0; i < resolved.size(); i++) {
+                ResolvedTab tab = resolved.get(i);
+                if (userKey.equals(MainPageTabsUtils.userKey(tab.postType, tab.name))) {
+                    return i;
+                }
+            }
+            return -1;
         }
 
         @Override
