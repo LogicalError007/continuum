@@ -49,7 +49,7 @@ A Reddit client on Android written in Java. It does not have any ads and it feat
 
 ---
 # Fork
-This project is a fork of [Infinity for Reddit](https://github.com/Docile-Alligator/Infinity-For-Reddit).
+Continuum project is a fork of [Infinity for Reddit](https://github.com/Docile-Alligator/Infinity-For-Reddit).
 
 One major enhancement is that it lets you set your own `Client ID` as a setting.
 This means you don't need to recompile it each time, or to use [ReVanced Manager](https://github.com/ReVanced/revanced-manager).
