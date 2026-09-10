@@ -48,6 +48,12 @@
         app:title="@string/settings_default_search_result_tab"
         app:useSimpleSummaryProvider="true" />
 
+    <ml.docilealligator.infinityforreddit.customviews.preference.CustomFontSwitchPreference
+        app:defaultValue="true"
+        app:key="show_random_subreddit_in_search"
+        app:title="@string/settings_show_random_subreddit_in_search_title"
+        app:summary="@string/settings_show_random_subreddit_in_search_summary" />
+
     <ml.docilealligator.infinityforreddit.customviews.preference.CustomFontPreference
         app:title="@string/settings_time_format_title"
         app:fragment="ml.docilealligator.infinityforreddit.settings.TimeFormatPreferenceFragment" />

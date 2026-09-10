@@ -129,6 +129,11 @@ public class SearchActivity extends BaseActivity {
      */
     private boolean canOpenRandomSubreddit;
     /**
+     * Settings toggle for the random-subreddit block on this screen. Read once: this activity is
+     * created fresh on every launch and offers no route to the setting that would change it.
+     */
+    private boolean showRandomSubredditSection;
+    /**
      * Whether NSFW content is allowed at all. Read once: this screen is created fresh on every
      * launch and offers no route to the settings that would change it.
      */
@@ -212,6 +217,8 @@ public class SearchActivity extends BaseActivity {
         }
 
         nsfw = mNsfwAndSpoilerSharedPreferences.getBoolean(AccountScope.key(accountName, SharedPreferencesUtils.NSFW_BASE), false);
+        showRandomSubredditSection = mSharedPreferences.getBoolean(
+                SharedPreferencesUtils.SHOW_RANDOM_SUBREDDIT_IN_SEARCH, true);
 
         // Naming a NSFW subreddit picker is the kind of thing that makes the app awkward to open in
         // public, so the row is not offered to anyone who has turned NSFW off. The note goes with
@@ -533,7 +540,7 @@ public class SearchActivity extends BaseActivity {
      */
     private void showRandomSubredditOptions(boolean show) {
         binding.randomSubredditsLinearLayoutSearchActivity.setVisibility(
-                show && canOpenRandomSubreddit ? View.VISIBLE : View.GONE);
+                show && canOpenRandomSubreddit && showRandomSubredditSection ? View.VISIBLE : View.GONE);
     }
 
     private void openRandomSubreddit(String randomSubredditName) {

@@ -801,6 +801,8 @@
     <string name="settings_show_nsfw_toggle_in_navigation_drawer_title">Show NSFW Toggle</string>
     <string name="settings_show_thumbnail_on_the_left_toggle_in_navigation_drawer_title">Show Thumbnail on the Left Toggle</string>
     <string name="settings_default_search_result_tab">Default Search Result Tab</string>
+    <string name="settings_show_random_subreddit_in_search_title">Show Random Subreddit Section</string>
+    <string name="settings_show_random_subreddit_in_search_summary">Show the random subreddit shortcuts on the search screen</string>
     <string name="settings_crash_reports_title">Crash Reports</string>
     <string name="settings_show_only_one_comment_level_indicator">Show Only One Comment Level Indicator</string>
     <string name="settings_video_player_automatic_landscape_orientation">Switch to Landscape Orientation in Video Player Automatically</string>
